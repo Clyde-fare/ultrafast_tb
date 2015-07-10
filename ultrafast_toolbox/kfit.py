@@ -1,3 +1,6 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import odeint
 from scipy.optimize import curve_fit
 
 def dX(X,t,k):
@@ -110,7 +113,7 @@ class Kinetics_Fit(object):
         """Simulation of a single spectral trace"""
         X0 = self.guess_x0
         
-        k=K(ks,connectivity)
+        k=K(ks,self.connectivity)
         concs = X(t,k,X0)
         
         spectral_contribs = concs * abs_factor
