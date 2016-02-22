@@ -7,8 +7,8 @@ Created on Mon Feb 22 14:44:11 2016
 
 import numpy as np
 from sklearn.linear_model import LinearRegression
-from scipy.optimize import leastsq
 from scipy.integrate import odeint
+from lmfit import minimize, Parameters
 
 class UltraFast_TB(object):
     def __init__(self, times=None,traces=None,wavelengths=None, 
@@ -26,24 +26,32 @@ class UltraFast_TB(object):
         self.fitted_traces = None
         self.fitted_spectra = None
     
-        self.r_singular_vectors = None
+        self.output = None
+        
     def apply_svd(self, n):
         """
         Replaces spectral traces with their SVD transformed equivalents
         truncating at the nth component
         """
     
-        # need to handle svd sensibly if we have multiple traces
-        # fitting multiple traces simultaneously requires they all have the
-        # same basis so we pick the first trace to define the basis
-        svd_trace, s, self.rs_vectors = np.linalg.svd(self.traces[0], full_matrices=True)
-        transformed_traces = [svd_trace[:,:n]]
-        if len(self.traces > 1):
-            # haven't tested this at all it's probably a bug filled mess
-            # idea is to represent all the traces with the principle components
-            # defined by the first set of traces
-            transformed_traces += [self.rs_vectors.dot(t) for t in self.traces[1:]] 
+        ## need to handle svd sensibly if we have multiple traces
+        ## fitting multiple traces simultaneously requires they all have the
+        ## same basis so we pick the first trace to define the basis
+        #svd_trace, s, self.rs_vectors = np.linalg.svd(self.traces[0], full_matrices=True)
+        #transformed_traces = [svd_trace[:,:n]]
+        #if len(self.traces > 1):
+        #    # haven't tested this at all it's probably a bug filled mess
+        #    # idea is to represent all the traces with the principle components
+        #    # defined by the first set of traces
+        #    transformed_traces += [self.rs_vectors.dot(t)[:,:n] for t in self.traces[1:]] 
 
+        # Maybe it's ok to transform every trace individually -the fact that the resultant
+        # traces will have different bases shouldn't affect the fitting process
+
+        transformed_traces = []
+        for trace in self.traces:
+            U,s,V = np.linalg.svd(trace, full_matrices=True)
+            transformed_traces.append(U[:,:n])
         self.traces = transformed_traces
         
     def get_spectra(self, conc_traces,spectral_trace):
@@ -80,7 +88,8 @@ class UltraFast_TB(object):
         The generated rate function has three arguments:
             C an array of floats giving the concentration of each species
             t a float giving the current time (not used but necessary for ODEs)
-            K an array of floats giving the rate constants.
+            K an lmfit Parameters object defining with float values 
+            representing the rate constants.
         
         And returns:
             dc/dt an array floats corresponding to the derivative of the concentration
@@ -93,7 +102,7 @@ class UltraFast_TB(object):
         # In our example positive_dcdt = [0, k1[A], k2[B]]  and negative_dcdt = [-k1[A],-k2[B],0]
         reaction_matrix = np.array(self.reaction_matrix,dtype=np.int)
         C = np.array(C)
-        K = np.array(K)
+        K = np.array(K.valuesdict().values())
         
         # need to be careful about dtypes here:
         # reaction matrix dtype is int, rate matrix must be dtype float
@@ -118,7 +127,7 @@ class UltraFast_TB(object):
         As we wish to simultaneously fit multiple data sets T and S contain multiple
         arrays of times and spectral traces respectively.
         
-        K is an array of rate constants for the rate equation
+        K an lmfit Parameters object representing the rate constants.
         
         implit dependence on:
         self.c0 - an array of initial conditions, so that c(t0) = c0
@@ -153,7 +162,8 @@ class UltraFast_TB(object):
             self.c0 = np.zeros(len(k_guess)+1)
             self.c0[0] = 1
                        
-        fitted_k,success = leastsq(self.errfunc, self.guess_ks) 
+        self.output = minimize(self.errfunc, self.guess_ks)
+        fitted_k = self.output.params
         fitted_C = odeint(self.dc_dt, self.c0, self.times[0], 
                           args=(fitted_k,))
        
@@ -180,23 +190,34 @@ def plot_traces(fitted_traces,time, wavelengths=None):
 if __name__ == '__main__':
     from matplotlib import pyplot as plt
 
-    reaction_matrix = [[0, 0, 0],
-                       [1, 0, 0],
-                       [0, 1, 0]]
-    
     test_times = [np.loadtxt('test_time.csv',delimiter=',')]
     test_traces = [np.loadtxt('test_trace.csv',delimiter=',')]
     test_spectra = np.loadtxt('test_spectra.csv',delimiter=',')
     test_wavelengths = np.loadtxt('test_wavelengths.csv',delimiter=',')
-    
-    c0 = np.array([1,0,0])
-    k_guess = np.array([-1,0.1],dtype=np.float64)
 
+    reaction_matrix = [[0, 0, 0],
+                       [1, 0, 0],
+                       [0, 1, 0]]
+        
+    k_guess = Parameters()
+    #                (Name, Value, Vary, Min, Max,  Expr)
+    k_guess.add_many(('k1', 0.1,   True, None,   None, None),
+                     ('k2', 0.1,   True, None,   None, None))
+                     
     tb = UltraFast_TB(test_times, test_traces, test_wavelengths, 
-                      reaction_matrix,k_guess, c0)
+                      reaction_matrix, k_guess)
+    tb.apply_svd(n=3)    
     tb.fit_kinetics()
     
-    print(tb.fitted_ks)
+    k_fit = tb.fitted_ks
+    k_fit['k1'].vary = False
+    k_fit['k2'].vary = False
+    
+    tb = UltraFast_TB(test_times, test_traces, test_wavelengths, 
+                      reaction_matrix, k_fit)
+    tb.fit_kinetics()
+
+    print([k.value for k in k_fit.values()])
     plt.subplot(211)
     plt.plot(tb.fitted_spectra[0])
     plt.subplot(212)
