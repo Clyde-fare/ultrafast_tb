@@ -26,6 +26,7 @@ class UltraFast_TB(object):
         self.fitted_traces = None
         self.fitted_spectra = None
     
+        self.resampled_times = None
         self.output = None
         
     def apply_svd(self, n):
@@ -153,73 +154,184 @@ class UltraFast_TB(object):
         return all_residuals
         
         
-    def fit_kinetics(self):
+    def fit(self):
         """Master fitting function"""
-        
-        if self.c0 is None:
-            # if init concentrations not specified assume first component starts at concentration 1 and 
-            # all other start a concentration 0
-            self.c0 = np.zeros(len(k_guess)+1)
-            self.c0[0] = 1
                        
         self.output = minimize(self.errfunc, self.guess_ks)
         fitted_k = self.output.params
-        fitted_C = odeint(self.dc_dt, self.c0, self.times[0], 
-                          args=(fitted_k,))
-       
-        self.fitted_ks = fitted_k
-        self.fitted_C = fitted_C
-        self.fitted_traces = [self.get_traces(tb.fitted_C, t) for t in self.traces]
-        self.fitted_spectra = [self.get_spectra(tb.fitted_C, t) for t in self.traces]
-  
-
-def plot_traces(fitted_traces,time, wavelengths=None):
-    """Utility plotting function"""
-    for i,wavelength_trace in enumerate(fitted_traces.T):
-        if wavelengths is not None:
-            wavelength = '{:.2f}'.format(wavelengths[i])
-        else:
-            wavelength = ''
         
-        plt.figure(figsize=(3,3))
-        plt.plot(time,wavelength_trace,label=wavelength)
+        fitted_C = [odeint(self.dc_dt,self.c0,t,
+                           args=(fitted_k,)) for t in self.times]
+       
+        self.fitted_traces = [self.get_traces(c, t) for c,t in zip(fitted_C,
+                                                                  self.traces)]
+        self.fitted_spectra = [self.get_spectra(c, t) for c,t in zip(fitted_C,
+                                                                  self.traces)]
+                
+        self.fitted_ks = fitted_k
+        self.fitted_C = fitted_C        
+        
+    def fit_sequential(self, no_species):
+        """
+        Utility function to fit assuming a sequential reaction model
+        
+        Sets the reaction matrix up for a sequential model then calls the 
+        master fit() method
+        """
+        
+        self.reaction_matrix = np.zeros([no_species, no_species])
+        
+        for i in range(no_species-1):       
+            self.reaction_matrix[i,i+1] = 1
+            
+        if self.c0 is None:
+            # if init concentrations not specified assume first component 
+            # starts at concentration 1 and all others start at concentration 0
+            self.c0 = np.zeros(no_species)
+            self.c0[0] = 1
+        
+        self.fit()
+    
+    def fit_parallel(self, no_species):
+        """
+        Utility function to fit assuming a parallel reaction model
+        
+        Sets the reaction matrix up for a parallel model then calls the 
+        master fit() method
+        """
+        
+        self.reaction_matrix = np.zeros([no_species, no_species])
+        
+        for i in range(0,no_species,2):
+            self.reaction_matrix[i,i+1] = 1
+        
+        if self.c0 is None:
+            self.c0 = np.zeros(no_species)
+            
+            for i in range(0,no_species,2):
+                self.c0[i] = 1
+            
+        self.fit()        
+    
+        
+    def plot_traces(self, ind=None, semilog=False):
+        """Utility plotting function"""
+        
+        if self.wavelengths is None:
+            self.wavelengths = [range(s.shape[0]) for s in self.fitted_spectra]
+        
+        if ind is None:
+            fitted_traces_to_plot = self.fitted_traces
+            orig_traces_to_plot = self.traces
+            times_to_plot = self.times
+            wavelengths_to_plot = self.wavelengths
+        else:
+            fitted_traces_to_plot = self.fitted_traces[ind:ind+1]
+            orig_traces_to_plot = self.traces[ind:ind+1]
+            times_to_plot = self.times[ind:ind+1]
+            wavelengths_to_plot = self.wavelengths[ind:ind+1]
+         
+        if semilog:
+            plot_f = plt.semilogx
+        else:
+            plot_f = plt.plot
+            
+        for orig_traces,fit_traces,times,wlengths in zip(orig_traces_to_plot,
+                                                         fitted_traces_to_plot,
+                                                         times_to_plot,
+                                                         wavelengths_to_plot):
+                                                     
+            for i,wavelength_traces in enumerate(zip(orig_traces.T,
+                                                     fit_traces.T)):
+                if self.wavelengths is not None:
+                    wavelength = '{:.2f}'.format(wlengths[i])
+                else:
+                    wavelength = ''
+                
+                plt.figure(figsize=(3,3))
+                plot_f(times,wavelength_traces[0],marker='o',linestyle='')
+                plot_f(times,wavelength_traces[1],label=wavelength)
+                
+                plt.legend()
+            plt.show()
+
+    def plot_spectra(self, ind=None):
+        """Utility plotting function"""
+        
+        # hopefully we need less than 26 species!
+        species = iter('ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+        
+        if self.wavelengths is None:
+            self.wavelengths = [range(s.shape[0]) for s in self.fitted_spectra]
+
+        if ind is None:
+            spectra_to_plot = self.fitted_spectra
+            wavelengths_to_plot = self.wavelengths
+        else:
+            spectra_to_plot = self.fitted_spectra[ind:ind+1]
+            wavelengths_to_plot = self.wavelengths[ind:ind+1]
+        
+        for wlengths, spectra in zip(wavelengths_to_plot, spectra_to_plot):
+            
+            plt.figure()
+            for spectrum in spectra.T:           
+                plt.plot(wlengths, spectrum,label=species.next())
+            plt.legend()
+            plt.show()
+        
+    def plot_concentrations(self):
+        """Utility plotting function"""
+        
+        # hopefully we need less than 26 species!
+        species = iter('ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+        
+        # resample times so that we get a good curve
+        no_points = max([len(t) for t in self.times])
+        max_time = max(np.ravel(self.times))
+        resampled_times = np.linspace(0, max_time, no_points*5)        
+        
+        resampled_C = odeint(self.dc_dt, self.c0, resampled_times, 
+                               args=(self.fitted_ks,))
+        
+        for c in resampled_C.T:
+            plt.plot(resampled_times, c, label=species.next())
+            
         plt.legend()
-    plt.show()
-
-
+        plt.show()
+        
 if __name__ == '__main__':
     from matplotlib import pyplot as plt
 
+    test_spectra = np.loadtxt('test_spectra.csv',delimiter=',')
     test_times = [np.loadtxt('test_time.csv',delimiter=',')]
     test_traces = [np.loadtxt('test_trace.csv',delimiter=',')]
-    test_spectra = np.loadtxt('test_spectra.csv',delimiter=',')
-    test_wavelengths = np.loadtxt('test_wavelengths.csv',delimiter=',')
+    test_wavelengths = [np.loadtxt('test_wavelengths.csv',delimiter=',')]
 
     reaction_matrix = [[0, 0, 0],
                        [1, 0, 0],
                        [0, 1, 0]]
-        
+    c0 = [1,0,0]
+    
     k_guess = Parameters()
     #                (Name, Value, Vary, Min, Max,  Expr)
     k_guess.add_many(('k1', 0.1,   True, None,   None, None),
                      ('k2', 0.1,   True, None,   None, None))
                      
     tb = UltraFast_TB(test_times, test_traces, test_wavelengths, 
-                      reaction_matrix, k_guess)
+                      reaction_matrix, k_guess, c0)
     tb.apply_svd(n=3)    
-    tb.fit_kinetics()
+    tb.fit()
     
     k_fit = tb.fitted_ks
     k_fit['k1'].vary = False
     k_fit['k2'].vary = False
     
     tb = UltraFast_TB(test_times, test_traces, test_wavelengths, 
-                      reaction_matrix, k_fit)
-    tb.fit_kinetics()
+                      reaction_matrix, k_fit, c0)
+    tb.fit()
 
+    tb.plot_spectra()
+    tb.plot_traces()
+    tb.plot_concentrations()
+    
     print([k.value for k in k_fit.values()])
-    plt.subplot(211)
-    plt.plot(tb.fitted_spectra[0])
-    plt.subplot(212)
-    plt.plot(test_spectra)
-    plt.show()
