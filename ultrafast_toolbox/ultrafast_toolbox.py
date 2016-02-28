@@ -6,28 +6,40 @@ Created on Mon Feb 22 14:44:11 2016
 """
 
 import numpy as np
-from sklearn.linear_model import LinearRegression
+import warnings
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.preprocessing import Imputer
 from scipy.integrate import odeint
 from lmfit import minimize, Parameters
-
+       
 class UltraFast_TB(object):
     def __init__(self, times=None,traces=None,wavelengths=None, 
-                 reaction_matrix=None,guess_ks=None,c0=None):
+                 guess_ks=None,reaction_matrix=None,c0=None, alpha=0):
+                             
         self.times = times
         self.traces = traces
         self.wavelengths = wavelengths
         self.reaction_matrix = reaction_matrix
         self.guess_ks = guess_ks
         self.c0 = c0
-        
+         
         self.last_residuals = None
         self.fitted_ks = None
         self.fitted_C = None
         self.fitted_traces = None
         self.fitted_spectra = None
     
+        self.resampled_C = None
         self.resampled_times = None
         self.output = None
+    
+        self.extras = {}
+        
+        if alpha:
+            self.regressor = Ridge(fit_intercept=False,alpha=alpha) 
+        else:
+            self.regressor = LinearRegression(fit_intercept=False)
+            
         
     def apply_svd(self, n):
         """
@@ -50,39 +62,43 @@ class UltraFast_TB(object):
         # traces will have different bases shouldn't affect the fitting process
 
         transformed_traces = []
+        # wavelengths now correspond to principle components
+        transformed_wavelengths = []
+        
         for trace in self.traces:
             U,s,V = np.linalg.svd(trace, full_matrices=True)
             transformed_traces.append(U[:,:n])
+            transformed_wavelengths.append(np.arange(n))
+        
         self.traces = transformed_traces
+        self.wavelengths = transformed_wavelengths        
         
     def get_spectra(self, conc_traces,spectral_trace):
         """Extraction of predicted spectra given concentration traces and spectral_traces"""
         # linear fit of the fitted_concs to the spectra CANNOT fit intercept here!
-        l=LinearRegression(fit_intercept=False)
-        l.fit(conc_traces,spectral_trace)
-        fitted_spectra = l.coef_
+        self.regressor.fit(conc_traces,spectral_trace)
+        fitted_spectra = self.regressor.coef_
         return fitted_spectra
     
     
     def get_traces(self, conc_traces, spectral_trace):
         """Extraction of fitted spectral traces given concentration traces and spectral traces"""
         # linear fit of the fitted_concs to the spectra CANNOT fit intercept here!
-        l=LinearRegression(fit_intercept=False)
-        l.fit(conc_traces,spectral_trace)
-        fitted_spectral_traces = l.predict(conc_traces)
+        self.regressor.fit(conc_traces,spectral_trace)
+        fitted_spectral_traces = self.regressor.predict(conc_traces)
         return fitted_spectral_traces
      
-        
+    
     def dc_dt(self,C,t,K):
         """
         Rate function for the given reaction matrix.
         
-        Columns of the reaction matrix correspond reactant species
-        Rows of the reaction correspond to product species
+        Rows of the reaction matrix correspond reactant species
+        Columns of the reaction correspond to product species
         
-        e.g. reaction_matrix = [[0, 0, 0],
-                                [1, 0, 0],
-                                [0, 1, 0]]
+        e.g. reaction_matrix = [[0, 1, 0],
+                                [0, 0, 1],
+                                [0, 0, 0]]
               
         Corresponds to the reaction scheme A->B->C.
         
@@ -104,19 +120,44 @@ class UltraFast_TB(object):
         reaction_matrix = np.array(self.reaction_matrix,dtype=np.int)
         C = np.array(C)
         K = np.array(K.valuesdict().values())
+
+        # need to have the same number of rate parameters in K
+        # as indicated in reaction_matrix!
+        assert len(K) == np.sum(reaction_matrix)
         
-        # need to be careful about dtypes here:
+        # need to be careful about dtypes:
         # reaction matrix dtype is int, rate matrix must be dtype float
         rate_matrix = reaction_matrix.copy()
         rate_matrix.dtype=np.float64
         rate_matrix[reaction_matrix==1] = K
         
-        positive_dcdt = rate_matrix.dot(C)
-        negative_dcdt = rate_matrix.sum(axis=0)*C
+        positive_dcdt = rate_matrix.T.dot(C)
+        negative_dcdt = rate_matrix.T.sum(axis=0)*C
             
         return positive_dcdt - negative_dcdt
        
-       
+        
+    def C(self,t,K):
+        """
+        Concentration function returns concentrations at the times given in t
+        Uses odeint to integrate dc/dt using rate constants k over times t.
+        Implicitly uses self.c0 and self.dc_dt
+        """
+        #ode(self.dc_dt,self.c0,t,args=(k,)).set_integrator('lsoda')
+        #ode(self.dc_dt,self.c0,t,args=(k,)).set_integrator('vode', method='bdf', order=15)
+        
+        # if we have any negative times we assume they occur before the 
+        # reaction starts hence all negative times are assigned concentration 
+        # c0
+        
+        static_C = np.array([self.c0 for _ in t[t<0]])
+        dynamic_C = odeint(self.dc_dt,self.c0,t[t>=0],args=(K,))
+        
+        if static_C.any():
+            return np.vstack([static_C,dynamic_C])
+        else:
+            return dynamic_C
+   
    # define a function that will measure the error between the fit and the real data:
     def errfunc(self, K):
         """
@@ -137,31 +178,50 @@ class UltraFast_TB(object):
         self.times - the array over which integration occurs
                      since we have several data sets and each one has its own 
                      array of time points, self.times is an array of arrays.
-        self.traces - the spectral data, it is an array of arrays
+        self.traces - the spectral data, it is an array of array of arrays
         """
+        
         self.residuals = []    
-    
-        # compute the residuals for each array of times/spectral traces
-        for times,spectral_trace in zip(self.times,self.traces):
-            fitted_conc_traces = odeint(self.dc_dt, self.c0, times, args=(K,))
-            fitted_spectral_traces = self.get_traces(fitted_conc_traces, spectral_trace)
+        # compute the residuals for each dataset of times/traces
+        for times,traces in zip(self.times,self.traces):
+            fitted_conc_traces = self.C(times, K)
             
-            #residuals for the time traces of each of the species
-            self.residuals += [fitted_spectral_traces[:,i] - spectral_trace[:,i] for i in range(spectral_trace.shape[1])]
-
+            if np.isnan(fitted_conc_traces).any():
+                fix = Imputer(missing_values='NaN', strategy='median',axis=0) 
+                fitted_conc_traces  = fix.fit_transform(fitted_conc_traces )
+                warnings.warn('Nan found in predicted concentrations')
+                
+            fitted_spectral_traces = self.get_traces(fitted_conc_traces, traces)
+            current_residuals = fitted_spectral_traces - traces
+            self.residuals.append(current_residuals)
+ 
+        # do we need to worry about the order of the flattened residuals? 
+        # e.g. if switch current_residuals for current_residuals.T 
+        # would it matter?
+ 
+        # combine residuals for each data set and flatten
         all_residuals = np.hstack(self.residuals).ravel()
         
         return all_residuals
-        
-        
-    def fit(self):
+    
+    def debug_fit(self, params,iter,resid,*args,**kwargs):
+        """Method passed to minimize if we are debugging"""
+
+        print(iter)  
+        print(params.valuesdict())
+                    
+    def fit(self, debug=False):
         """Master fitting function"""
-                       
-        self.output = minimize(self.errfunc, self.guess_ks)
+                    
+        if debug:
+            self.output = minimize(self.errfunc, self.guess_ks, 
+                                 iter_cb=self.debug_fit)
+        else:
+            self.output = minimize(self.errfunc, self.guess_ks)
+
         fitted_k = self.output.params
         
-        fitted_C = [odeint(self.dc_dt,self.c0,t,
-                           args=(fitted_k,)) for t in self.times]
+        fitted_C = [self.C(t,fitted_k) for t in self.times]
        
         self.fitted_traces = [self.get_traces(c, t) for c,t in zip(fitted_C,
                                                                   self.traces)]
@@ -169,9 +229,18 @@ class UltraFast_TB(object):
                                                                   self.traces)]
                 
         self.fitted_ks = fitted_k
-        self.fitted_C = fitted_C        
+        self.fitted_C = fitted_C  
         
-    def fit_sequential(self, no_species):
+        
+        # create master resampled concentration data
+        no_points = max([len(t) for t in self.times])
+        max_time = max(np.ravel(self.times))
+        self.resampled_times = np.linspace(0, max_time, no_points*5)        
+        
+        self.resampled_C = self.C(self.resampled_times,self.fitted_ks)
+
+        
+    def fit_sequential(self, no_species, debug=False):
         """
         Utility function to fit assuming a sequential reaction model
         
@@ -190,9 +259,15 @@ class UltraFast_TB(object):
             self.c0 = np.zeros(no_species)
             self.c0[0] = 1
         
-        self.fit()
+        if self.guess_ks is None:
+            guess_ks = Parameters()
+            guess_ks.add_many(*[('k{i}'.format(i=n),0.1,True,0,None,None) 
+                               for n in range(1,no_species)])
+            self.guess_ks = guess_ks
+            
+        self.fit(debug)
     
-    def fit_parallel(self, no_species):
+    def fit_parallel(self, no_species,debug=False):
         """
         Utility function to fit assuming a parallel reaction model
         
@@ -202,136 +277,71 @@ class UltraFast_TB(object):
         
         self.reaction_matrix = np.zeros([no_species, no_species])
         
-        for i in range(0,no_species,2):
+        for i in range(0,no_species-1,2):
             self.reaction_matrix[i,i+1] = 1
         
         if self.c0 is None:
             self.c0 = np.zeros(no_species)
             
-            for i in range(0,no_species,2):
+            for i in range(0,no_species-1,2):
                 self.c0[i] = 1
-            
-        self.fit()        
+        
+        if self.guess_ks is None:
+            guess_ks = Parameters()
+            guess_ks.add_many(*[('k{i}'.format(i=n),0.1,True,0,None,None) 
+                               for n in range(1,no_species,2)])
+            self.guess_ks = guess_ks
+        self.fit(debug)        
     
+    def tex_reaction_scheme(self):
+        """Returns a Latex representation of the current reaction scheme"""
         
-    def plot_traces(self, ind=None, semilog=False):
-        """Utility plotting function"""
-        
-        if self.wavelengths is None:
-            self.wavelengths = [range(s.shape[0]) for s in self.fitted_spectra]
-        
-        if ind is None:
-            fitted_traces_to_plot = self.fitted_traces
-            orig_traces_to_plot = self.traces
-            times_to_plot = self.times
-            wavelengths_to_plot = self.wavelengths
-        else:
-            fitted_traces_to_plot = self.fitted_traces[ind:ind+1]
-            orig_traces_to_plot = self.traces[ind:ind+1]
-            times_to_plot = self.times[ind:ind+1]
-            wavelengths_to_plot = self.wavelengths[ind:ind+1]
-         
-        if semilog:
-            plot_f = plt.semilogx
-        else:
-            plot_f = plt.plot
+        if self.reaction_matrix is None or self.guess_ks is None:
+            return 'undefined'
             
-        for orig_traces,fit_traces,times,wlengths in zip(orig_traces_to_plot,
-                                                         fitted_traces_to_plot,
-                                                         times_to_plot,
-                                                         wavelengths_to_plot):
-                                                     
-            for i,wavelength_traces in enumerate(zip(orig_traces.T,
-                                                     fit_traces.T)):
-                if self.wavelengths is not None:
-                    wavelength = '{:.2f}'.format(wlengths[i])
-                else:
-                    wavelength = ''
-                
-                plt.figure(figsize=(3,3))
-                plot_f(times,wavelength_traces[0],marker='o',linestyle='')
-                plot_f(times,wavelength_traces[1],label=wavelength)
-                
-                plt.legend()
-            plt.show()
-
-    def plot_spectra(self, ind=None):
-        """Utility plotting function"""
+        species = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        eqn = []
         
-        # hopefully we need less than 26 species!
-        species = iter('ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+        reactants, products = self.reaction_matrix.nonzero()
+        for r,p,k in zip(reactants, products,self.guess_ks.keys()):
+            eqn.append( species[r] + r'\xrightarrow{{' + k + '}}' + species[p])
+        return '$' + ','.join(eqn) + '$'
         
-        if self.wavelengths is None:
-            self.wavelengths = [range(s.shape[0]) for s in self.fitted_spectra]
-
-        if ind is None:
-            spectra_to_plot = self.fitted_spectra
-            wavelengths_to_plot = self.wavelengths
-        else:
-            spectra_to_plot = self.fitted_spectra[ind:ind+1]
-            wavelengths_to_plot = self.wavelengths[ind:ind+1]
-        
-        for wlengths, spectra in zip(wavelengths_to_plot, spectra_to_plot):
-            
-            plt.figure()
-            for spectrum in spectra.T:           
-                plt.plot(wlengths, spectrum,label=species.next())
-            plt.legend()
-            plt.show()
-        
-    def plot_concentrations(self):
-        """Utility plotting function"""
-        
-        # hopefully we need less than 26 species!
-        species = iter('ABCDEFGHIJKLMNOPQRSTUVWXYZ')
-        
-        # resample times so that we get a good curve
-        no_points = max([len(t) for t in self.times])
-        max_time = max(np.ravel(self.times))
-        resampled_times = np.linspace(0, max_time, no_points*5)        
-        
-        resampled_C = odeint(self.dc_dt, self.c0, resampled_times, 
-                               args=(self.fitted_ks,))
-        
-        for c in resampled_C.T:
-            plt.plot(resampled_times, c, label=species.next())
-            
-        plt.legend()
-        plt.show()
         
 if __name__ == '__main__':
-    from matplotlib import pyplot as plt
-
+    
+    from plot_utils import plot_spectra, plot_traces, plot_concentrations
+    
     test_spectra = np.loadtxt('test_spectra.csv',delimiter=',')
     test_times = [np.loadtxt('test_time.csv',delimiter=',')]
     test_traces = [np.loadtxt('test_trace.csv',delimiter=',')]
     test_wavelengths = [np.loadtxt('test_wavelengths.csv',delimiter=',')]
 
-    reaction_matrix = [[0, 0, 0],
-                       [1, 0, 0],
-                       [0, 1, 0]]
-    c0 = [1,0,0]
-    
-    k_guess = Parameters()
+#    reaction_matrix = [[0, 1, 0],
+#                       [0, 0, 1],
+#                       [0, 0, 0]]
+#    c0 = [1,0,0]
+#    
+    #k_guess = Parameters()
     #                (Name, Value, Vary, Min, Max,  Expr)
-    k_guess.add_many(('k1', 0.1,   True, None,   None, None),
-                     ('k2', 0.1,   True, None,   None, None))
+    #k_guess.add_many(('k1', 0.1,   True, None,   None, None),
+    #                 ('k2', 0.1,   True, None,   None, None))
                      
     tb = UltraFast_TB(test_times, test_traces, test_wavelengths, 
-                      reaction_matrix, k_guess, c0)
+                     )#k_guess , reaction_matrix, c0)
     tb.apply_svd(n=3)    
-    tb.fit()
+    tb.fit_sequential(3,debug=True)
     
     k_fit = tb.fitted_ks
-    k_fit['k1'].vary = False
-    k_fit['k2'].vary = False
+    for k in k_fit.values():
+        k.vary=False
     
     tb = UltraFast_TB(test_times, test_traces, test_wavelengths, 
-                      reaction_matrix, k_fit, c0)
-    tb.fit()
+                      k_fit)#, reaction_matrix, c0)
+    tb.fit_sequential(3)
 
-    tb.plot_spectra()
-    tb.plot_traces()
-    tb.plot_concentrations()
+    plot_spectra(tb)
+    #plot_traces(tb)
+    plot_concentrations(tb)
     
     print([k.value for k in k_fit.values()])
