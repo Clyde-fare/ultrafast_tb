@@ -8,6 +8,7 @@ Created on Mon Feb 22 14:44:11 2016
 #import scipy
 import numpy as np
 import warnings
+import copy
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
 from sklearn.preprocessing import Imputer
 from scipy.integrate import odeint
@@ -15,7 +16,7 @@ from lmfit import minimize, Parameters
        
 class UltraFast_TB(object):
     def __init__(self, times=None,traces=None,wavelengths=None, 
-                 input_params=None,reaction_matrix=None,c0=None, 
+                 input_params=None,reaction_matrix=None,
                  method='leastsq',alpha=0,gamma=0):
                              
         self.times = times
@@ -23,10 +24,15 @@ class UltraFast_TB(object):
         self.wavelengths = wavelengths
         self.reaction_matrix = reaction_matrix
         self.input_params = input_params
-        self.c0 = c0
-         
+
+        try:
+            self.no_species = self.reaction_matrix.shape[0]
+        except AttributeError:
+            self.no_species = None
+
         self.last_residuals = None
         self.fitted_ks = None
+        self.fitted_c0 = None
         self.fitted_C = None
         self.fitted_traces = None
         self.fitted_spectra = None
@@ -149,14 +155,15 @@ class UltraFast_TB(object):
         return positive_dcdt - negative_dcdt
        
         
-    def C(self,t,K):
+    def C(self,t,K,c0):
         """
         Concentration function returns concentrations at the times given in t
-        Uses odeint to integrate dc/dt using rate constants k over times t.
-        Implicitly uses self.c0 and self.dc_dt
+        Uses odeint to integrate dc/dt using rate constants k over times t at
+        initial concentrations c0
+        Implicitly uses self.dc_dt
         """
-        #ode(self.dc_dt,self.c0,t,args=(k,)).set_integrator('lsoda')
-        #ode(self.dc_dt,self.c0,t,args=(k,)).set_integrator('vode', method='bdf', order=15)
+        #ode(self.dc_dt,c0,t,args=(k,)).set_integrator('lsoda')
+        #ode(self.dc_dt,c0,t,args=(k,)).set_integrator('vode', method='bdf', order=15)
         
         # if we have any negative times we assume they occur before the 
         # reaction starts hence all negative times are assigned concentration 
@@ -164,35 +171,72 @@ class UltraFast_TB(object):
         
         ## could switch to something like ode15s that the oiginal matlab code 
         ## uses - can odeint cope with equations as stiff as we need?
-        ## to use integrrate.ode need order of arguments in dc_dt to switch
+        ## to use integrate.ode need order of arguments in dc_dt to switch
         
         #r = scipy.integrate.ode(self.dc_dt)
         #r = r.set_integrator('vode', method='bdf', order=15,nsteps=3000)
-        #r = r.set_initial_value(self.c0)
+        #r = r.set_initial_value(c0)
         #r = r.set_f_params((K,))
         #r.integrate(t)
         
         static_times = t[t<0]
         dynamic_times = t[t>=0]
 
-        static_C = np.array([self.c0 for _ in static_times])
+        static_C = np.array([c0 for _ in static_times])
 
         # odeint always takes the first time point as t0
         # our t0 is always 0 (removing t0 occures before we integrate)
         # so if the first time point is not 0 we add it 
                 
-        if dynamic_times[0]:
+        if not dynamic_times.any() or dynamic_times[0]:
             #fancy indexing returns a copy so we can do this
             dynamic_times = np.hstack([[0],dynamic_times])            
-            dynamic_C = odeint(self.dc_dt,self.c0,dynamic_times,args=(K,))[1:]
+            dynamic_C = odeint(self.dc_dt,c0,dynamic_times,args=(K,))[1:]
         else:
-            dynamic_C = odeint(self.dc_dt,self.c0,dynamic_times,args=(K,))
+            dynamic_C = odeint(self.dc_dt,c0,dynamic_times,args=(K,))
             
         if static_C.any():
             return np.vstack([static_C,dynamic_C])
         else:
             return dynamic_C
    
+    def _get_K(self, params):
+        no_datasets = len(self.traces)
+        n_Ks = int(np.sum(self.reaction_matrix))
+       
+        K=[]
+        for d in range(1,no_datasets+1):
+            k_keys = ['k{i}{d}'.format(i=i,d=d) for i in range(1,n_Ks+1)]
+            dataset_K = np.array([params[key].value for key in k_keys])
+            K.append(dataset_K)
+        return K
+    
+    def _get_C0(self, params):
+        no_datasets = len(self.traces)
+        n_c0s = self.no_species
+        
+        C0 = []
+        for d in range(1,no_datasets+1):
+            c0_keys = ['c0{i}{d}'.format(i=i,d=d) for i in range(1,n_c0s+1)]
+            dataset_c0 = np.array([params[key].value for key in c0_keys])
+            C0.append(dataset_c0)
+            
+        return C0
+        
+    def _get_T0(self, params):
+        no_datasets = len(self.traces)
+        
+        T0_keys = ['t0{d}'.format(d=d) for d in range(1,no_datasets+1)]
+        T0 = np.array([params[key].value for key in T0_keys])
+        return T0
+        
+    def _get_OD_offset(self, params):        
+        no_datasets = len(self.traces)
+        
+        OD_keys = ['OD_offset{d}'.format(d=d) for d in range(1,no_datasets+1)]
+        OD = np.array([params[key].value for key in OD_keys])
+        return OD
+        
    # define a function that will measure the error between the fit and the real data:
     def errfunc(self, params):
         """
@@ -204,40 +248,30 @@ class UltraFast_TB(object):
         As we wish to simultaneously fit multiple data sets T and S contain multiple
         arrays of times and spectral traces respectively.
         
-        K an lmfit Parameters object representing the rate constants.
+        params an lmfit Parameters object representing the rate constants, 
+        initial concentrations,initial times, and OD offsets.
         
         implit dependence on:
-        self.c0 - an array of initial conditions, so that c(t0) = c0
-        self.dc_dt - function to be integrated by odeint to get the concentrations
+        dc_dt - function to be integrated by odeint to get the concentrations
         
         self.times - the array over which integration occurs
                      since we have several data sets and each one has its own 
                      array of time points, self.times is an array of arrays.
         self.traces - the spectral data, it is an array of array of arrays
         """
-        
-        # rate constants must be in order i.e. k1 must be added before k2
-        rate_constant_strs = [key for key in params if 'k' in key]
-        K_params = [params[k] for k in rate_constant_strs]
-        K = np.array([k_param.value for k_param in K_params])
-        
-        # t0 values must be in order i.e. t01 before t02
-        T0_strs = [key for key in params if 't0' in key]
-        T0_params = [params[key] for key in T0_strs]
-        T0 = np.array([t0_param.value for t0_param in T0_params])
-        
-        # OD_offset values must be in order i.e. OD_offset1 before OD_offset2
-        OD_strs = [key for key in params if 'OD_offset' in key]
-        OD_params = [params[key] for key in OD_strs]
-        OD_offset = np.array([od_param.value for od_param in OD_params])
+
+        K = self._get_K(params)
+        T0 = self._get_T0(params)
+        C0 = self._get_C0(params)        
+        OD_offset = self._get_OD_offset(params)
         
         offset_times = [t-t0 for t,t0 in zip(self.times,T0)]
         offset_traces = [st - od for st,od in zip(self.traces,OD_offset)]
 
         # calculated concentrations for the different time sets
         fitted_conc_traces = []   
-        for t in offset_times:
-            conc_traces = self.C(t,K)
+        for t ,k, c0 in zip(offset_times,K,C0):
+            conc_traces = self.C(t,k,c0)
 
             if np.isnan(conc_traces).any():
                 fix = Imputer(missing_values='NaN', strategy='median',axis=0) 
@@ -249,16 +283,16 @@ class UltraFast_TB(object):
         # spectra fitted against all data sets
         # REQUIRES spectral traces to be measured at the SAME WAVELENGTHS!
         
-        fitted_spectra = self.get_spectra(np.hstack(fitted_conc_traces),
-                                          np.hstack(offset_traces))
-                                          
+        fitted_spectra = self.get_spectra(np.vstack(fitted_conc_traces),
+                                          np.vstack(offset_traces))
+                                                
         fitted_spectral_traces = [self.get_traces(c, fitted_spectra) for c in
                                         fitted_conc_traces]
             
         self.residuals = [fst -t for fst,t in zip(fitted_spectral_traces,
                                                   offset_traces)]
             
-        all_residuals = np.hstack(self.residuals).ravel()
+        all_residuals = np.vstack(self.residuals).ravel()
         
         return all_residuals
         
@@ -303,10 +337,12 @@ class UltraFast_TB(object):
 
         print(iter)  
         print(params.valuesdict())
-                    
+    
     def fit(self, debug=False):
         """Master fitting function"""
-                    
+        
+        self.expand_params()
+
         if debug:
             self.output = minimize(self.errfunc, self.input_params, 
                                    method=self.method,iter_cb=self.printfunc)
@@ -315,58 +351,189 @@ class UltraFast_TB(object):
                                    method=self.method)
 
         fitted_params = self.output.params
-
-        rate_constant_strs = [key for key in fitted_params if 'k' in key]        
-        fitted_k_params = [fitted_params[key] for key in rate_constant_strs]
-        fitted_k = np.array([k_param.value for k_param in fitted_k_params])
-              
-        T0_strs = [key for key in fitted_params if 't0' in key]
-        fitted_T0_params = [fitted_params[key] for key in T0_strs]
-        fitted_T0 = np.array([t0_param.value for t0_param in fitted_T0_params])
+      
+        fitted_K = self._get_K(fitted_params)
+        fitted_T0 = self._get_T0(fitted_params)
+        fitted_OD_offset = self._get_OD_offset(fitted_params)
+        fitted_C0 = self._get_C0(fitted_params)
         
-        OD_strs = [key for key in fitted_params if 'OD_offset' in key]
-        fitted_OD_params = [fitted_params[key] for key in OD_strs]
-        fitted_OD = np.array([od_param.value for od_param in fitted_OD_params])
-
         offset_traces = [traces - od for traces,od in zip(self.traces,
-                                                          fitted_OD)]
+                                                          fitted_OD_offset)]
                                                         
         offset_times = [times - t0 for times,t0 in zip(self.times, 
                                                        fitted_T0)]
                                                        
-        fitted_C = [self.C(t, fitted_k) for t in offset_times]
+        fitted_C = [self.C(t, fitted_k, c0) for t,fitted_k,c0 in zip(offset_times,
+                                                                  fitted_K,
+                                                                  fitted_C0)]
        
-        fitted_spectra = self.get_spectra(np.hstack(fitted_C),
-                                          np.hstack(offset_traces))
+        fitted_spectra = self.get_spectra(np.vstack(fitted_C),
+                                          np.vstack(offset_traces))
                                           
         
         fitted_traces = [self.get_traces(c, fitted_spectra) for c in fitted_C]
          
         self.fitted_spectra = fitted_spectra
         self.fitted_traces = fitted_traces
-        self.fitted_ks = fitted_k
+        self.fitted_ks = fitted_K
         self.fitted_t0 = fitted_T0
-        self.fitted_OD_offset = fitted_OD
+        self.fitted_c0 = fitted_C0        
+        self.fitted_OD_offset = fitted_OD_offset
         self.fitted_C = fitted_C  
         
         # create master resampled data
         no_points = max([len(t) for t in offset_times])
-        max_time = max(np.ravel(offset_times))
-        min_time = min(np.ravel(offset_times))
+        max_time = max(np.hstack(offset_times))
+        min_time = min(np.hstack(offset_times))
         
         if min_time > 0:
             min_time = 0
         
-        resampled_offset_times = np.linspace(min_time, max_time, no_points*5)
+        resampled_times = np.linspace(min_time, max_time, no_points*5)
         
-        self.resampled_C = self.C(resampled_offset_times,self.fitted_ks)
-        self.resampled_traces = self.get_traces(self.resampled_C, 
-                                                self.fitted_spectra)
-                                                
-        # for resampled times we arbitrarily choose to align with the
-        # first dataset
-        self.resampled_times = resampled_offset_times + self.fitted_t0[0]
+        self.resampled_C = [self.C(resampled_times,k,c0) for k,c0 in zip(fitted_K,
+                                                                         fitted_C0)]
+        self.resampled_traces = [self.get_traces(c,self.fitted_spectra) for c in
+                                        self.resampled_C]
+          
+        self.resampled_times = [resampled_times + t0 for t0 in fitted_T0]
+     
+    def expand_params(self):
+        """
+        If only a single set of parameters has been provided then we expand 
+        the parameters by constructing a set for each dataset
+        """
         
+        no_datasets = len(self.traces)
+        no_species = self.reaction_matrix.shape[0]
+        
+        t0_keys = [key for key in self.input_params.keys() if 't0' in key]
+        od_keys = [key for key in self.input_params.keys() if 'OD' in key]
+        k_keys = [key for key in self.input_params.keys() if 'k' in key]
+        c0_keys = [key for key in self.input_params.keys() if 'c0' in key]
+       
+        enum_keys = list(enumerate(self.input_params.keys()))
+        first_t0 = next(i for i,key in enum_keys if 't0' in key)
+        first_od = next(i for i,key in  enum_keys if 'OD' in key)
+        first_k = next(i for i,key in enum_keys if 'k' in key)
+        first_c0 = next(i for i,key in enum_keys if 'c0' in key)
+        
+        t0_params = [self.input_params.pop(k) for k in t0_keys]
+        od_params = [self.input_params.pop(k) for k in od_keys]
+        k_params = [self.input_params.pop(k) for k in k_keys]
+        c0_params = [self.input_params.pop(k) for k in c0_keys]
+        
+        if len(t0_keys) == 1 and t0_keys[0] == 't0':            
+            p = t0_params[0]
+            new_t0_params = []            
+            for d in range(1,no_datasets+1):
+                new_p = copy.deepcopy(p)
+                new_p.name += str(d)
+                new_t0_params.append(new_p)
+            t0_params = new_t0_params
+            
+        if len(od_keys) == 1 and od_keys[0] == 'OD_offset':             
+            p = od_params[0]
+            new_od_params = []
+            for d in range(1,no_datasets+1):
+                new_p = copy.deepcopy(p)
+                new_p.name += str(d)
+                new_od_params.append(new_p)
+            od_params = new_od_params
+            
+        # TODO - this is not adequate - what if the first rate parameter 
+        # isn't k1?
+        if len(k_keys) == self.reaction_matrix.sum() and k_keys[0] == 'k1':
+            new_k_params = []
+            for p in k_params:
+                for d in range(1,no_datasets+1):
+                    new_p = copy.deepcopy(p)                    
+                    new_p.name += str(d)
+                    new_k_params.append(new_p)
+            k_params = new_k_params
+            
+        if len(c0_keys) == no_species and c0_keys[0] == 'c01':
+            new_c0_params = []
+            for p in c0_params:
+                for d in range(1,no_datasets+1):
+                    new_p = copy.deepcopy(p)
+                    new_p.name += str(d)
+                    new_c0_params.append(new_p)
+            c0_params = new_c0_params
+            
+        # as lmfit parameters objects are ordered dictionaries the order
+        # that we do this actually matters and will influence the fitting
+        # we would like to allow the used to specify the order and respect the 
+        # order they choose.
+        
+        # NB The ideal order is to have the parameters whos initial values are 
+        # better optimised after the parameters whos initial values are worse       
+           
+        expanded_params = sorted([(t0_params,first_t0),
+                                  (od_params,first_od),
+                                  (k_params,first_k),
+                                  (c0_params,first_c0)], key=lambda e:e[1])
+        expanded_params, loc = zip(*expanded_params)
+                       
+        for ep in expanded_params:
+            self.input_params.add_many(*ep)
+    
+    # TODO order is not yet ideal - would like explicitly given parameters
+    # to be optimised last        
+    def init_sequential(self, no_species):
+        """Initialises parameters for a sequential fit"""        
+        
+        if not self.no_species is None and self.no_species != no_species:
+            raise UserWarning('Inconsistent number of species')
+        
+        if not self.reaction_matrix is None:
+            raise UserWarning('Reaction matrix already specified')
+
+        self.reaction_matrix = np.zeros([no_species, no_species])
+        self.no_species = no_species
+        
+        no_datasets = len(self.traces)
+        
+        for i in range(no_species-1):       
+            self.reaction_matrix[i,i+1] = 1
+        
+        if self.input_params is None:
+            self.input_params = Parameters()
+        
+        # if no rate constants set, assign n-1 rate constants to a default
+        # of 0.1 for each dataset
+        if not any(['k' in key for key in self.input_params.valuesdict()]):
+            rate_constants = [('k{i}{d}'.format(i=n,d=d),0.1,True,0,None,None) 
+                               for n in range(1,no_species)
+                               for d in range(1,no_datasets+1)]                  
+            self.input_params.add_many(*rate_constants)
+          
+        # if no t0s assign t0 to a default of 0 and flag them not to be
+        # optimised for each dataset
+        if not any(['t0' in key for key in self.input_params.valuesdict()]):
+            t0 = [('t0{d}'.format(d=d),0,False,None,None,None)
+                  for d in range(1,no_datasets+1)]
+            self.input_params.add_many(*t0)
+        
+        # if no OD_offsets assign OD_offset to a default of 0 and flag them
+        # not to be optimised for each dataset          
+        if not any(['OD' in key for key in self.input_params.valuesdict()]):
+            OD_offset = [('OD_offset{d}'.format(d=d),0,False,None,None,None)
+                         for d in range(1,no_datasets+1)]
+            self.input_params.add_many(*OD_offset)
+ 
+       # if no c0s assign c0 to a default of [1,0,0,...] and flag them
+        # not to be optimised  for each dataset        
+        if not any(['c0' in key for key in self.input_params.valuesdict()]):
+            C0 = [('c0{i}{d}'.format(i=n,d=d),0,False,0,1,None)
+                         for n in range(1,no_species+1)
+                         for d in range(1,no_datasets+1)]
+        
+            self.input_params.add_many(*C0)
+            
+            for d in range(1,no_datasets+1):
+                self.input_params['c01{d}'.format(d=d)].value = 1
+                
     def fit_sequential(self, no_species, debug=False):
         """
         Utility function to fit assuming a sequential reaction model
@@ -374,40 +541,69 @@ class UltraFast_TB(object):
         Sets the reaction matrix up for a sequential model then calls the 
         master fit() method
         """
-        
+ 
+        self.init_sequential(no_species)
+        self.fit(debug)
+            
+    # TODO order is not yet ideal - would like explicitly given parameters
+    # to be optimised last
+    def init_parallel(self, no_species):
+        """Initialises parameters for a parallel fit"""
+        if not self.no_species is None and self.no_species != no_species:
+            raise UserWarning('Inconsistent number of species')
+         
+        if not self.reaction_matrix is None:
+            raise UserWarning('Reaction matrix already specified')
+
         self.reaction_matrix = np.zeros([no_species, no_species])
-        
+        self.no_species = no_species
+                
         no_datasets = len(self.traces)
         
-        for i in range(no_species-1):       
+        for i in range(0,no_species-1,2):
             self.reaction_matrix[i,i+1] = 1
-            
-        if self.c0 is None:
-            # if init concentrations not specified assume first component 
-            # starts at concentration 1 and all others start at concentration 0
-            self.c0 = np.zeros(no_species)
-            self.c0[0] = 1
+        
         
         if self.input_params is None:
             self.input_params = Parameters()
-            
+        
+        # if no rate constants set, assign n-1 rate constants to a default
+        # of 0.1 for each dataset
         if not any(['k' in key for key in self.input_params.valuesdict()]):
-            rate_constants = [('k{i}'.format(i=n),0.1,True,0,None,None) 
-                               for n in range(1,no_species)]
+            rate_constants = [('k{i}{d}'.format(i=n,d=d),0.1,True,0,None,None) 
+                              for n in range(1,no_species,2)
+                              for d in range(1,no_datasets+1)]
             self.input_params.add_many(*rate_constants)
-          
+
+        # if no t0s assign n t0s to a default of 0 and flat them not to be
+        # optimised
         if not  any(['t0' in key for key in self.input_params.valuesdict()]):
             t0 = [('t0{i}'.format(i=n),0,False,None,None,None)
-                  for n in range(no_datasets)]
+                  for n in range(1,no_datasets+1)]
             self.input_params.add_many(*t0)
-                   
+        
+        # if no OD_offsets assign OD_offset to a default of 0 and flag them
+        # not to be optimised for each dataset
         if not  any(['OD' in key for key in self.input_params.valuesdict()]):
             OD_offset = [('OD_offset{i}'.format(i=n),0,False,None,None,None)
-                         for n in range(no_datasets)]
-            self.input_params.add_many(*OD_offset)
+                         for n in range(1,no_datasets+1)]
+            self.input_para,s.add_many(*OD_offset)
+
+        # if no c0s assign c0 to a default of 1 and flag them
+        # not to be optimised for each dataset
+       # if no c0s assign c0 to a default of [1,0,0,...] and flag them
+        # not to be optimised  for each dataset        
+        if not any(['c0' in key for key in self.input_params.valuesdict()]):
+            C0 = [('c0{i}{d}'.format(i=n,d=d),0,False,0,1,None)
+                         for n in range(1,no_species+1)
+                         for d in range(1,no_datasets+1)]
+        
+            self.input_params.add_many(*C0)
             
-        self.fit(debug)
-    
+            for n in range(1,no_species,2):
+                for d in range(1,no_datasets+1):
+                    self.input_params['c0{i}{d}'.format(i=n,d=d)].value = 1
+                    
     def fit_parallel(self, no_species,debug=False):
         """
         Utility function to fit assuming a parallel reaction model
@@ -416,37 +612,7 @@ class UltraFast_TB(object):
         master fit() method
         """
         
-        self.reaction_matrix = np.zeros([no_species, no_species])
-        
-        for i in range(0,no_species-1,2):
-            self.reaction_matrix[i,i+1] = 1
-        
-        if self.c0 is None:
-            self.c0 = np.zeros(no_species)
-            
-            for i in range(0,no_species-1,2):
-                self.c0[i] = 1
-        
-        if self.input_params is None:
-            self.input_params = Parameters()
-        # if no rate constants set, assign n-1 rate constants to a default
-        # of 0.1
-        if not any(['k' in key for key in self.input_params.valuesdict()]):
-            rate_constants = [('k{i}'.format(i=n),0.1,True,0,None,None) 
-                              for n in range(1,no_species,2)]
-            self.input_params.add_many(*rate_constants)
-
-        if not  any(['t0' in key for key in self.input_params.valuesdict()]):
-            t0 = [('t0{i}'.format(i=n),0,False,None,None,None)
-                  for n in range(no_datasets)]
-            self.input_params.add_many(*t0)
-                    
-        if not  any(['OD' in key for key in self.input_params.valuesdict()]):
-            OD_offset = [('OD_offset{i}'.format(i=n),0,False,None,None,None)
-                         for n in range(no_datasets)]
-            self.input_para,s.add_many(*OD_offset)
-
-            
+        self.init_parallel(no_species)
         self.fit(debug)        
     
     def tex_reaction_scheme(self):
@@ -461,33 +627,41 @@ class UltraFast_TB(object):
         reactants, products = self.reaction_matrix.nonzero()
         for r,p,k in zip(reactants, products,self.input_params.keys()):
             eqn.append( species[r] + r'\xrightarrow{{' + k + '}}' + species[p])
-        return '$' + ','.join(eqn) + '$'
         
+        latex_eqn = r'$' + ','.join(eqn) + r'$'
+        return latex_eqn        
         
 if __name__ == '__main__':
     
+    from lmfit import fit_report
     import matplotlib.pyplot as plt
     from plot_utils import *
     
     test_spectra = np.loadtxt('test_spectra.csv',delimiter=',')
-    test_times = [np.loadtxt('test_time.csv',delimiter=',')]
-    test_traces = [np.loadtxt('test_trace.csv',delimiter=',')]
+    test_times = [np.loadtxt('test_time.csv',delimiter=',')+0,
+                  np.loadtxt('test_time.csv',delimiter=',')+1]
+    test_traces = [np.loadtxt('test_trace.csv',delimiter=','),
+                   np.loadtxt('test_trace.csv',delimiter=',')]
     test_wavelengths = np.loadtxt('test_wavelengths.csv',delimiter=',')
 
 #    reaction_matrix = [[0, 1, 0],
 #                       [0, 0, 1],
 #                       [0, 0, 0]]
-#    c0 = [1,0,0]
 #    
-    #k_guess = Parameters()
-    #                 (Name,        Value, Vary,  Min,    Max,  Expr)
-    #k_guess.add_many(('k1',        0.1,   True,  None,   None, None),
-    #                 ('k2',        0.1,   True,  None,   None, None),
-    #                 ('t0',        0,     False, None,   None, None),
-    #                 ('OD_offset', 0,     False, None,   None, None))
-                     
+    input_params = Parameters()
+    #                     (Name,        Value,  Vary,  Min,   Max,  Expr)
+    input_params.add_many(('k1',        0.1,    True,  0,     None, None),
+                          ('k2',        0.1,    True,  0,     None, None),
+                          ('t01',         0,     False, None,  None, None),
+                          ('t02',        1.,     False, None,  None, None),
+                          ('OD_offset1', 0,      False, None,  None, None),
+                          ('OD_offset2', 0,      False, None,  None, None),
+                          ('c01',        1,      False, None,  None, None),
+                          ('c02',        0,      False, None,  None, None),
+                          ('c03',        0,      False, None,  None, None))
+
     tb = UltraFast_TB(test_times, test_traces, test_wavelengths, alpha=1e-5,
-                     )#k_guess , reaction_matrix, c0)
+                      input_params=input_params) #, reaction_matrix)
     tb.apply_svd(n=3)    
     tb.fit_sequential(3,debug=True)
     
@@ -496,16 +670,17 @@ if __name__ == '__main__':
         k.vary=False
     
     tb = UltraFast_TB(test_times, test_traces, test_wavelengths, 
-                      fitted_params)#, reaction_matrix, c0)
+                      input_params=fitted_params)#, reaction_matrix)
     tb.fit_sequential(3)
 
     #plot_spectra(tb)
     #plot_traces(tb)
     #plot_concentrations(tb)
     
-    plot_master(tb,trace_wavelengths=(125,150,175,230,275))
+    plot_master(tb,trace_wavelengths=(125,150,175,230,275),ind=0)
     
-    print([k.value for k in fitted_params.values()])
+    print('Residuals: ', np.abs(tb.residuals).sum())
+    print(fit_report(fitted_params))
     
     plt.plot(test_spectra)
     plt.show()
