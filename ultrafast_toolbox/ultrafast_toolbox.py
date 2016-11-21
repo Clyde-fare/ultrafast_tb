@@ -36,7 +36,8 @@ class UltraFast_TB(object):
         self.fitted_C = None
         self.fitted_traces = None
         self.fitted_spectra = None
-    
+
+        self.no_resampled_points = None    
         self.resampled_C = None
         self.resampled_times = None
         self.output = None
@@ -382,14 +383,18 @@ class UltraFast_TB(object):
         self.fitted_C = fitted_C  
         
         # create master resampled data
-        no_points = max([len(t) for t in offset_times])
+        if self.no_resampled_points:
+            no_points = self.no_resampled_points
+        else:
+            no_points = max([len(t) for t in offset_times])*5
+
         max_time = max(np.hstack(offset_times))
         min_time = min(np.hstack(offset_times))
         
         if min_time > 0:
             min_time = 0
         
-        resampled_times = np.linspace(min_time, max_time, no_points*5)
+        resampled_times = np.linspace(min_time, max_time, no_points)
         
         self.resampled_C = [self.C(resampled_times,k,c0) for k,c0 in zip(fitted_K,
                                                                          fitted_C0)]
